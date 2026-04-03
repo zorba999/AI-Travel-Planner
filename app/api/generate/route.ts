@@ -76,7 +76,8 @@ async function runTSInference(params: {
   });
 
   const client = new x402Client();
-  registerExactEvmScheme(client, { signer });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  registerExactEvmScheme(client, { signer: signer as any });
 
   // TEE servers use self-signed TLS certs — disable verification for testnet
   const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
