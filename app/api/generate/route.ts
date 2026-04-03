@@ -198,16 +198,29 @@ async function runTSInference(params: {
   }
 
   // Step 2: Parse payment requirements
+  // V2 protocol: requirements are in PAYMENT-REQUIRED header (base64 JSON)
+  // V1 protocol: requirements are in body as paymentRequirements array
   const paymentText = await initialRes.text();
-  let paymentBody: Record<string, unknown> = {};
-  try { paymentBody = JSON.parse(paymentText); } catch { /* not JSON */ }
+  const paymentRequiredHeader = initialRes.headers.get('payment-required');
 
-  let requirements = paymentBody.paymentRequirements as Array<Record<string, unknown>> | undefined;
-  if (!requirements && paymentBody.accepts) {
-    requirements = paymentBody.accepts as Array<Record<string, unknown>>;
+  let requirements: Array<Record<string, unknown>> | undefined;
+
+  if (paymentRequiredHeader) {
+    // V2: base64-decode the header
+    try {
+      const decoded = JSON.parse(Buffer.from(paymentRequiredHeader, 'base64').toString());
+      requirements = decoded.paymentRequirements || decoded.accepts || [decoded];
+    } catch { /* ignore */ }
   }
+
+  if (!requirements) {
+    let paymentBody: Record<string, unknown> = {};
+    try { paymentBody = JSON.parse(paymentText); } catch { /* not JSON */ }
+    requirements = (paymentBody.paymentRequirements || paymentBody.accepts) as Array<Record<string, unknown>> | undefined;
+  }
+
   if (!requirements || requirements.length === 0) {
-    throw new Error(`No payment requirements in 402 response: ${paymentText.slice(0, 500)}`);
+    throw new Error(`No payment requirements in 402 response: header=${paymentRequiredHeader?.slice(0, 100)} body=${paymentText.slice(0, 300)}`);
   }
 
   // Pick upto requirement first, then any
@@ -217,10 +230,10 @@ async function runTSInference(params: {
   const paymentPayload = await signUptoPayment(account, req);
   const paymentHeader = Buffer.from(JSON.stringify(paymentPayload)).toString('base64');
 
-  // Step 4: Retry with payment
+  // Step 4: Retry with payment — V2 uses PAYMENT-SIGNATURE header
   const res = await teeFetch(apiUrl, {
     method: 'POST',
-    headers: { ...baseHeaders, 'X-PAYMENT': paymentHeader },
+    headers: { ...baseHeaders, 'PAYMENT-SIGNATURE': paymentHeader },
     body: bodyJson,
   });
 
