@@ -5,7 +5,7 @@ import { createPublicClient, createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { baseSepolia } from 'viem/chains';
 import { x402Client, wrapFetchWithPayment } from '@x402/fetch';
-import { ExactEvmScheme } from '@x402/evm/exact/client';
+import { UptoEvmScheme } from '@x402/evm/upto/client';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -75,9 +75,25 @@ async function runTSInference(params: {
     transport: http('https://sepolia.base.org'),
   });
 
+  // The TEE server sends "upto" requirements but omits facilitatorAddress in extra.
+  // Patch it in at the scheme level using the x402 proxy address from the library.
+  const X402_UPTO_PROXY = '0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002';
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const baseScheme = new UptoEvmScheme(signer as any);
+  const patchedUptoScheme = {
+    scheme: 'upto',
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    createPaymentPayload: (ver: number, req: any, ctx?: any) => {
+      if (!req.extra?.facilitatorAddress) {
+        req = { ...req, extra: { ...req.extra, facilitatorAddress: X402_UPTO_PROXY } };
+      }
+      return baseScheme.createPaymentPayload(ver, req, ctx);
+    },
+  };
+
   const client = new x402Client();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  client.register('eip155:84532', new ExactEvmScheme(signer as any));
+  client.register('eip155:84532', patchedUptoScheme as any);
 
   // TEE servers use self-signed TLS certs — disable verification for testnet
   const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
