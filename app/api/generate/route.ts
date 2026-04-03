@@ -1,11 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { spawn } from 'child_process';
 import path from 'path';
-import { createPublicClient, createWalletClient, http } from 'viem';
+import crypto from 'crypto';
+import { createPublicClient, http, getAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { baseSepolia } from 'viem/chains';
-import { x402Client, wrapFetchWithPayment } from '@x402/fetch';
-import { UptoEvmScheme } from '@x402/evm/upto/client';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -58,6 +56,79 @@ async function getTEEEndpoint(): Promise<string> {
   return tee.endpoint;
 }
 
+/* ── x402 constants (matching Python SDK) ── */
+const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3' as `0x${string}`;
+const X402_UPTO_PROXY = '0xBe08D629cc799E6C17200F454F68A61E017038C8' as `0x${string}`;
+
+// Python SDK's Permit2 witness types (different from JS SDK!)
+const PERMIT2_WITNESS_TYPES = {
+  PermitWitnessTransferFrom: [
+    { name: 'permitted', type: 'TokenPermissions' },
+    { name: 'spender', type: 'address' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'deadline', type: 'uint256' },
+    { name: 'witness', type: 'Witness' },
+  ],
+  TokenPermissions: [
+    { name: 'token', type: 'address' },
+    { name: 'amount', type: 'uint256' },
+  ],
+  Witness: [
+    { name: 'to', type: 'address' },
+    { name: 'validAfter', type: 'uint256' },
+    { name: 'extra', type: 'bytes' },
+  ],
+} as const;
+
+/* ── Sign x402 upto payment (Python SDK compatible) ── */
+async function signUptoPayment(
+  account: ReturnType<typeof privateKeyToAccount>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  req: any,
+) {
+  const now = Math.floor(Date.now() / 1000);
+  const validAfter = now - 600;
+  const deadline = now + (req.maxTimeoutSeconds || 3600);
+  const nonce = BigInt('0x' + crypto.randomBytes(32).toString('hex'));
+
+  const tokenAddress = getAddress(req.asset);
+  const payTo = getAddress(req.payTo);
+
+  const signature = await account.signTypedData({
+    domain: {
+      name: 'Permit2',
+      chainId: 84532,
+      verifyingContract: PERMIT2_ADDRESS,
+    },
+    types: PERMIT2_WITNESS_TYPES,
+    primaryType: 'PermitWitnessTransferFrom',
+    message: {
+      permitted: { token: tokenAddress, amount: BigInt(req.amount) },
+      spender: X402_UPTO_PROXY,
+      nonce,
+      deadline: BigInt(deadline),
+      witness: { to: payTo, validAfter: BigInt(validAfter), extra: '0x' as `0x${string}` },
+    },
+  });
+
+  return {
+    x402Version: req.x402Version || 2,
+    scheme: req.scheme || 'upto',
+    network: req.network || 'eip155:84532',
+    payload: {
+      signature,
+      permit2Authorization: {
+        permitted: { token: tokenAddress, amount: req.amount },
+        spender: X402_UPTO_PROXY,
+        nonce: nonce.toString(),
+        deadline: deadline.toString(),
+        witness: { to: payTo, validAfter: validAfter.toString(), extra: '0x' },
+        from: account.address,
+      },
+    },
+  };
+}
+
 /* ── TypeScript x402 inference (used on Vercel) ── */
 async function runTSInference(params: {
   destination: string; days: number; budget: string;
@@ -67,70 +138,78 @@ async function runTSInference(params: {
   const { destination, days, budget, currency, styles, travelers, privateKey } = params;
 
   const teeEndpoint = await getTEEEndpoint();
-
   const account = privateKeyToAccount(privateKey as `0x${string}`);
-  const signer = createWalletClient({
-    account,
-    chain: baseSepolia,
-    transport: http('https://sepolia.base.org'),
-  });
-
-  // The TEE server sends "upto" requirements but omits facilitatorAddress in extra.
-  // Patch it in at the scheme level using the x402 proxy address from the library.
-  const X402_UPTO_PROXY = '0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002';
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const baseScheme = new UptoEvmScheme(signer as any);
-  const patchedUptoScheme = {
-    scheme: 'upto',
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    createPaymentPayload: (ver: number, req: any, ctx?: any) => {
-      if (!req.extra?.facilitatorAddress) {
-        req = { ...req, extra: { ...req.extra, facilitatorAddress: X402_UPTO_PROXY } };
-      }
-      return baseScheme.createPaymentPayload(ver, req, ctx);
-    },
-  };
-
-  const client = new x402Client();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  client.register('eip155:84532', patchedUptoScheme as any);
 
   // TEE servers use self-signed TLS certs — disable verification for testnet
   const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-  let res: Response;
   try {
-    const payingFetch = wrapFetchWithPayment(fetch, client);
-    res = await payingFetch(`${teeEndpoint}/v1/chat/completions`, {
+    const apiUrl = `${teeEndpoint}/v1/chat/completions`;
+    const bodyJson = JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: 'You are an expert travel planner. Return valid JSON only — no markdown, no code blocks.' },
+        { role: 'user', content: buildPrompt(destination, days, budget, currency, styles, travelers) },
+      ],
+      max_tokens: 3500,
+    });
+
+    // Step 1: Make initial request, expect 402
+    const initialRes = await fetch(apiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [
-          { role: 'system', content: 'You are an expert travel planner. Return valid JSON only — no markdown, no code blocks.' },
-          { role: 'user', content: buildPrompt(destination, days, budget, currency, styles, travelers) },
-        ],
-        max_tokens: 3500,
-      }),
+      body: bodyJson,
     });
+
+    if (initialRes.status !== 402) {
+      if (initialRes.ok) {
+        const data = await initialRes.json();
+        return { content: data.choices?.[0]?.message?.content ?? '', txHash: null };
+      }
+      throw new Error(`TEE API error ${initialRes.status}: ${await initialRes.text()}`);
+    }
+
+    // Step 2: Parse 402 payment requirements
+    const paymentBody = await initialRes.json();
+    const requirements = paymentBody.paymentRequirements;
+    if (!requirements || requirements.length === 0) {
+      throw new Error('No payment requirements in 402 response');
+    }
+
+    // Pick the first upto requirement, or first available
+    const req = requirements.find((r: { scheme: string }) => r.scheme === 'upto') || requirements[0];
+
+    // Step 3: Sign the payment
+    const paymentPayload = await signUptoPayment(account, req);
+
+    // Step 4: Retry with payment header
+    const paymentHeader = Buffer.from(JSON.stringify(paymentPayload)).toString('base64');
+    const res = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-PAYMENT': paymentHeader,
+      },
+      body: bodyJson,
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`TEE API error ${res.status}: ${text}`);
+    }
+
+    const data = await res.json();
+    const content: string = data.choices?.[0]?.message?.content ?? '';
+    const txHash =
+      res.headers.get('x-transaction-hash') ||
+      res.headers.get('x-payment-hash') ||
+      null;
+
+    return { content, txHash };
   } finally {
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = prev ?? '1';
   }
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`TEE API error ${res.status}: ${text}`);
-  }
-
-  const data = await res.json();
-  const content: string = data.choices?.[0]?.message?.content ?? '';
-  const txHash =
-    res.headers.get('x-transaction-hash') ||
-    res.headers.get('x-payment-hash') ||
-    null;
-
-  return { content, txHash };
 }
 
 /* ── Python subprocess inference (used locally) ── */
