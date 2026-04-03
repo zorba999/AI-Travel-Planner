@@ -6,6 +6,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { baseSepolia } from 'viem/chains';
 import { x402Client, wrapFetchWithPayment } from '@x402/fetch';
 import { UptoEvmScheme } from '@x402/evm/upto/client';
+import { ExactEvmScheme } from '@x402/evm/exact/client';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -77,7 +78,9 @@ async function runTSInference(params: {
 
   const client = new x402Client();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  client.register('eip155:*', new UptoEvmScheme(signer as any));
+  client.register('eip155:84532', new UptoEvmScheme(signer as any));
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  client.register('eip155:84532', new ExactEvmScheme(signer as any));
 
   // TEE servers use self-signed TLS certs — disable verification for testnet
   const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
