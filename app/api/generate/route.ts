@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { spawn } from 'child_process';
 import path from 'path';
-import crypto from 'crypto';
+import { randomBytes } from 'crypto';
 import { createPublicClient, http, getAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
@@ -89,7 +89,7 @@ async function signUptoPayment(
   const now = Math.floor(Date.now() / 1000);
   const validAfter = now - 600;
   const deadline = now + (req.maxTimeoutSeconds || 3600);
-  const nonce = BigInt('0x' + crypto.randomBytes(32).toString('hex'));
+  const nonce = BigInt('0x' + randomBytes(32).toString('hex'));
 
   const tokenAddress = getAddress(req.asset);
   const payTo = getAddress(req.payTo);
