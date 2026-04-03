@@ -142,10 +142,9 @@ async function signUptoPayment(
     },
   });
 
+  // V2 PaymentPayload structure (camelCase, matching Python SDK's model_dump_json by_alias)
   return {
-    x402Version: req.x402Version || 2,
-    scheme: req.scheme || 'upto',
-    network: req.network || 'eip155:84532',
+    x402Version: 2,
     payload: {
       signature,
       permit2Authorization: {
@@ -156,6 +155,15 @@ async function signUptoPayment(
         witness: { to: payTo, validAfter: validAfter.toString(), extra: '0x' },
         from: account.address,
       },
+    },
+    accepted: {
+      scheme: req.scheme,
+      network: req.network,
+      asset: req.asset,
+      amount: req.amount,
+      payTo: req.payTo,
+      maxTimeoutSeconds: req.maxTimeoutSeconds,
+      extra: req.extra || {},
     },
   };
 }
@@ -206,17 +214,19 @@ async function runTSInference(params: {
   let requirements: Array<Record<string, unknown>> | undefined;
 
   if (paymentRequiredHeader) {
-    // V2: base64-decode the header
+    // V2: PAYMENT-REQUIRED header is base64-encoded JSON of PaymentRequired
+    // PaymentRequired.accepts is the list of requirements (camelCase via alias)
     try {
       const decoded = JSON.parse(Buffer.from(paymentRequiredHeader, 'base64').toString());
-      requirements = decoded.paymentRequirements || decoded.accepts || [decoded];
+      requirements = decoded.accepts || decoded.paymentRequirements;
     } catch { /* ignore */ }
   }
 
   if (!requirements) {
+    // V1 fallback: requirements in body
     let paymentBody: Record<string, unknown> = {};
     try { paymentBody = JSON.parse(paymentText); } catch { /* not JSON */ }
-    requirements = (paymentBody.paymentRequirements || paymentBody.accepts) as Array<Record<string, unknown>> | undefined;
+    requirements = (paymentBody.accepts || paymentBody.paymentRequirements) as Array<Record<string, unknown>> | undefined;
   }
 
   if (!requirements || requirements.length === 0) {
