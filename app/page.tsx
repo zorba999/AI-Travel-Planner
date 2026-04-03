@@ -473,7 +473,8 @@ export default function Home() {
         (s) => TRAVEL_STYLES.find((t) => t.id === s)?.label.replace(/^\S+\s/, '') || s,
       );
 
-      const res = await fetch('/api/generate', {
+      const apiUrl = process.env.NEXT_PUBLIC_VERCEL_ENV ? '/api/infer' : '/api/generate';
+      const res = await fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
