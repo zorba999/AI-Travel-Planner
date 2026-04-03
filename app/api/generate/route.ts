@@ -171,10 +171,26 @@ async function runTSInference(params: {
     }
 
     // Step 2: Parse 402 payment requirements
-    const paymentBody = await initialRes.json();
-    const requirements = paymentBody.paymentRequirements;
+    // Requirements may be in body OR in a header
+    const paymentText = await initialRes.text();
+    let paymentBody: Record<string, unknown> = {};
+    try { paymentBody = JSON.parse(paymentText); } catch { /* not JSON */ }
+
+    // Also check for requirements in headers (some x402 servers use this)
+    const reqHeader = initialRes.headers.get('x-payment-requirements')
+      || initialRes.headers.get('x-402-requirements');
+
+    let requirements = paymentBody.paymentRequirements as Array<Record<string, unknown>> | undefined;
+    if (!requirements && reqHeader) {
+      try { requirements = JSON.parse(reqHeader); } catch { /* ignore */ }
+    }
+    // Some servers nest under "accepts"
+    if (!requirements && paymentBody.accepts) {
+      requirements = paymentBody.accepts as Array<Record<string, unknown>>;
+    }
+
     if (!requirements || requirements.length === 0) {
-      throw new Error('No payment requirements in 402 response');
+      throw new Error(`No payment requirements in 402 response: ${paymentText.slice(0, 500)}`);
     }
 
     // Pick the first upto requirement, or first available
