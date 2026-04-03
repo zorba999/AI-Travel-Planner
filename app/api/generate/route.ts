@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { spawn } from 'child_process';
 import path from 'path';
 import { randomBytes } from 'crypto';
+import https from 'https';
 import { createPublicClient, http, getAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
@@ -54,6 +55,36 @@ async function getTEEEndpoint(): Promise<string> {
   if (!tees || tees.length === 0) throw new Error('No active TEE servers found in registry');
   const tee = tees[Math.floor(Math.random() * tees.length)];
   return tee.endpoint;
+}
+
+/* ── HTTPS fetch that skips TLS verification for self-signed TEE certs ── */
+function teeFetch(url: string, options: { method: string; headers: Record<string, string>; body: string }): Promise<Response> {
+  return new Promise<Response>((resolve, reject) => {
+    const parsed = new URL(url);
+    const reqOptions: https.RequestOptions = {
+      hostname: parsed.hostname,
+      port: parsed.port || '443',
+      path: parsed.pathname + parsed.search,
+      method: options.method,
+      headers: { ...options.headers, 'Content-Length': Buffer.byteLength(options.body) },
+      rejectUnauthorized: false,
+    };
+    const req = https.request(reqOptions, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        const responseBody = Buffer.concat(chunks).toString();
+        const headers = new Headers();
+        Object.entries(res.headers).forEach(([k, v]) => {
+          if (v) headers.set(k, Array.isArray(v) ? v[0] : v);
+        });
+        resolve(new Response(responseBody, { status: res.statusCode ?? 500, headers }));
+      });
+    });
+    req.on('error', reject);
+    req.write(options.body);
+    req.end();
+  });
 }
 
 /* ── x402 constants (matching Python SDK) ── */
@@ -140,92 +171,72 @@ async function runTSInference(params: {
   const teeEndpoint = await getTEEEndpoint();
   const account = privateKeyToAccount(privateKey as `0x${string}`);
 
-  // TEE servers use self-signed TLS certs — disable verification for testnet
-  const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  const apiUrl = `${teeEndpoint}/v1/chat/completions`;
+  const bodyJson = JSON.stringify({
+    model: MODEL,
+    messages: [
+      { role: 'system', content: 'You are an expert travel planner. Return valid JSON only — no markdown, no code blocks.' },
+      { role: 'user', content: buildPrompt(destination, days, budget, currency, styles, travelers) },
+    ],
+    max_tokens: 3500,
+  });
+  const baseHeaders = {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer 0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
+    'X-SETTLEMENT-TYPE': 'x402',
+  };
 
-  try {
-    const apiUrl = `${teeEndpoint}/v1/chat/completions`;
-    const bodyJson = JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: 'You are an expert travel planner. Return valid JSON only — no markdown, no code blocks.' },
-        { role: 'user', content: buildPrompt(destination, days, budget, currency, styles, travelers) },
-      ],
-      max_tokens: 3500,
-    });
+  // Step 1: Initial request — expect 402 with payment requirements
+  const initialRes = await teeFetch(apiUrl, { method: 'POST', headers: baseHeaders, body: bodyJson });
 
-    // Step 1: Make initial request, expect 402
-    const initialRes = await fetch(apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: bodyJson,
-    });
-
-    if (initialRes.status !== 402) {
-      if (initialRes.ok) {
-        const data = await initialRes.json();
-        return { content: data.choices?.[0]?.message?.content ?? '', txHash: null };
-      }
-      throw new Error(`TEE API error ${initialRes.status}: ${await initialRes.text()}`);
+  if (initialRes.status !== 402) {
+    if (initialRes.ok) {
+      const data = await initialRes.json();
+      return { content: data.choices?.[0]?.message?.content ?? '', txHash: null };
     }
-
-    // Step 2: Parse 402 payment requirements
-    // Requirements may be in body OR in a header
-    const paymentText = await initialRes.text();
-    let paymentBody: Record<string, unknown> = {};
-    try { paymentBody = JSON.parse(paymentText); } catch { /* not JSON */ }
-
-    // Also check for requirements in headers (some x402 servers use this)
-    const reqHeader = initialRes.headers.get('x-payment-requirements')
-      || initialRes.headers.get('x-402-requirements');
-
-    let requirements = paymentBody.paymentRequirements as Array<Record<string, unknown>> | undefined;
-    if (!requirements && reqHeader) {
-      try { requirements = JSON.parse(reqHeader); } catch { /* ignore */ }
-    }
-    // Some servers nest under "accepts"
-    if (!requirements && paymentBody.accepts) {
-      requirements = paymentBody.accepts as Array<Record<string, unknown>>;
-    }
-
-    if (!requirements || requirements.length === 0) {
-      throw new Error(`No payment requirements in 402 response: ${paymentText.slice(0, 500)}`);
-    }
-
-    // Pick the first upto requirement, or first available
-    const req = requirements.find((r: { scheme: string }) => r.scheme === 'upto') || requirements[0];
-
-    // Step 3: Sign the payment
-    const paymentPayload = await signUptoPayment(account, req);
-
-    // Step 4: Retry with payment header
-    const paymentHeader = Buffer.from(JSON.stringify(paymentPayload)).toString('base64');
-    const res = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-PAYMENT': paymentHeader,
-      },
-      body: bodyJson,
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`TEE API error ${res.status}: ${text}`);
-    }
-
-    const data = await res.json();
-    const content: string = data.choices?.[0]?.message?.content ?? '';
-    const txHash =
-      res.headers.get('x-transaction-hash') ||
-      res.headers.get('x-payment-hash') ||
-      null;
-
-    return { content, txHash };
-  } finally {
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = prev ?? '1';
+    throw new Error(`TEE API error ${initialRes.status}: ${await initialRes.text()}`);
   }
+
+  // Step 2: Parse payment requirements
+  const paymentText = await initialRes.text();
+  let paymentBody: Record<string, unknown> = {};
+  try { paymentBody = JSON.parse(paymentText); } catch { /* not JSON */ }
+
+  let requirements = paymentBody.paymentRequirements as Array<Record<string, unknown>> | undefined;
+  if (!requirements && paymentBody.accepts) {
+    requirements = paymentBody.accepts as Array<Record<string, unknown>>;
+  }
+  if (!requirements || requirements.length === 0) {
+    throw new Error(`No payment requirements in 402 response: ${paymentText.slice(0, 500)}`);
+  }
+
+  // Pick upto requirement first, then any
+  const req = requirements.find((r) => r.scheme === 'upto') || requirements[0];
+
+  // Step 3: Sign the payment
+  const paymentPayload = await signUptoPayment(account, req);
+  const paymentHeader = Buffer.from(JSON.stringify(paymentPayload)).toString('base64');
+
+  // Step 4: Retry with payment
+  const res = await teeFetch(apiUrl, {
+    method: 'POST',
+    headers: { ...baseHeaders, 'X-PAYMENT': paymentHeader },
+    body: bodyJson,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`TEE API error ${res.status}: ${text}`);
+  }
+
+  const data = await res.json();
+  const content: string = data.choices?.[0]?.message?.content ?? '';
+  const txHash =
+    res.headers.get('x-transaction-hash') ||
+    res.headers.get('x-payment-hash') ||
+    null;
+
+  return { content, txHash };
 }
 
 /* ── Python subprocess inference (used locally) ── */
