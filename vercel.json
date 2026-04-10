@@ -4,7 +4,7 @@
     { "src": "package.json", "use": "@vercel/next" }
   ],
   "routes": [
-    { "src": "/api/generate", "dest": "/backend.py" },
+    { "src": "/api/(.*)", "dest": "/backend.py" },
     { "src": "/(.*)", "dest": "/$1" }
   ]
 }
